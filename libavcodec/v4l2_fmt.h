@@ -28,6 +28,15 @@
 #include "libavutil/pixfmt.h"
 #include "codec_id.h"
 
+/*
+ * Apple ProRes frames (one picture per buffer), as exposed by the Apple
+ * silicon ProRes encoder and decoder.  Defined here for kernel headers that
+ * do not carry it yet.
+ */
+#ifndef V4L2_PIX_FMT_PRORES
+#define V4L2_PIX_FMT_PRORES v4l2_fourcc('P', 'R', 'E', 'S')
+#endif
+
 enum AVPixelFormat ff_v4l2_format_v4l2_to_avfmt(uint32_t v4l2_fmt, enum AVCodecID avcodec);
 uint32_t ff_v4l2_format_avcodec_to_v4l2(enum AVCodecID avcodec);
 uint32_t ff_v4l2_format_avfmt_to_v4l2(enum AVPixelFormat avfmt);

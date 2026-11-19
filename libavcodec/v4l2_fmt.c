@@ -25,6 +25,14 @@
 #include <search.h>
 #include "v4l2_fmt.h"
 
+/* Fallbacks for kernel headers that predate these formats. */
+#ifndef V4L2_PIX_FMT_P216
+#define V4L2_PIX_FMT_P216 v4l2_fourcc('P', '2', '1', '6')
+#endif
+#ifndef V4L2_PIX_FMT_P416
+#define V4L2_PIX_FMT_P416 v4l2_fourcc('P', '4', '1', '6')
+#endif
+
 #define V4L2_FMT(x) V4L2_PIX_FMT_##x
 #define AV_CODEC(x) AV_CODEC_ID_##x
 #define AV_FMT(x)   AV_PIX_FMT_##x
@@ -74,6 +82,10 @@ static const struct fmt_conversion {
 #ifdef V4L2_PIX_FMT_NV16M
     { AV_FMT(NV16),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV16M) },
 #endif
+    { AV_FMT(NV16),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV16) },
+    { AV_FMT(NV24),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV24) },
+    { AV_FMT(P216LE),      AV_CODEC(RAWVIDEO),    V4L2_FMT(P216) },
+    { AV_FMT(P416LE),      AV_CODEC(RAWVIDEO),    V4L2_FMT(P416) },
 #ifdef V4L2_PIX_FMT_H263
     { AV_FMT(NONE),        AV_CODEC(H263),        V4L2_FMT(H263) },
 #endif
@@ -104,6 +116,7 @@ static const struct fmt_conversion {
 #ifdef V4L2_PIX_FMT_HEVC
     { AV_FMT(NONE),        AV_CODEC(HEVC),        V4L2_FMT(HEVC) },
 #endif
+    { AV_FMT(NONE),        AV_CODEC(PRORES),      V4L2_FMT(PRORES) },
 #ifdef V4L2_PIX_FMT_VC1_ANNEX_G
     { AV_FMT(NONE),        AV_CODEC(VC1),         V4L2_FMT(VC1_ANNEX_G) },
 #endif

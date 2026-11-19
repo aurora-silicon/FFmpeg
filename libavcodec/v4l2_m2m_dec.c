@@ -178,6 +178,20 @@ fail:
     return ret;
 }
 
+/*
+ * ProRes carries 10-bit 4:2:2 or 12-bit 4:4:4 samples. Ask for a 16-bit
+ * capture format with the stream's chroma layout so no precision is lost; the
+ * demuxer's pixel format (or the first frame) tells the layout.
+ */
+static enum AVPixelFormat v4l2_prores_capture_format(enum AVPixelFormat stream_fmt)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(stream_fmt);
+
+    if (desc && !desc->log2_chroma_w && !desc->log2_chroma_h)
+        return AV_PIX_FMT_P416LE;
+    return AV_PIX_FMT_P216LE;
+}
+
 static av_cold int v4l2_decode_init(AVCodecContext *avctx)
 {
     V4L2Context *capture, *output;
@@ -204,6 +218,8 @@ static av_cold int v4l2_decode_init(AVCodecContext *avctx)
 
     capture->av_codec_id = AV_CODEC_ID_RAWVIDEO;
     capture->av_pix_fmt = avctx->pix_fmt;
+    if (avctx->codec_id == AV_CODEC_ID_PRORES)
+        capture->av_pix_fmt = v4l2_prores_capture_format(avctx->pix_fmt);
 
     s->avctx = avctx;
     ret = ff_v4l2_m2m_codec_init(priv);
@@ -266,3 +282,4 @@ M2MDEC(h263,  "H.263", AV_CODEC_ID_H263,       NULL);
 M2MDEC(vc1 ,  "VC1",   AV_CODEC_ID_VC1,        NULL);
 M2MDEC(vp8,   "VP8",   AV_CODEC_ID_VP8,        NULL);
 M2MDEC(vp9,   "VP9",   AV_CODEC_ID_VP9,        NULL);
+M2MDEC(prores, "ProRes", AV_CODEC_ID_PRORES,    NULL);

@@ -160,6 +160,51 @@ static int v4l2_check_b_frame_support(V4L2m2mContext *s)
     return AVERROR_PATCHWELCOME;
 }
 
+#ifndef V4L2_CID_MPEG_VIDEO_PRORES_PROFILE
+#define V4L2_CID_MPEG_VIDEO_PRORES_PROFILE (V4L2_CID_CODEC_BASE + 658)
+#endif
+
+/* The V4L2 ProRes profile menu uses the same order as AV_PROFILE_PRORES_*. */
+static const struct {
+    int profile;
+    uint32_t tag;
+} v4l2_prores_profiles[] = {
+    { AV_PROFILE_PRORES_PROXY,    MKTAG('a', 'p', 'c', 'o') },
+    { AV_PROFILE_PRORES_LT,       MKTAG('a', 'p', 'c', 's') },
+    { AV_PROFILE_PRORES_STANDARD, MKTAG('a', 'p', 'c', 'n') },
+    { AV_PROFILE_PRORES_HQ,       MKTAG('a', 'p', 'c', 'h') },
+    { AV_PROFILE_PRORES_4444,     MKTAG('a', 'p', '4', 'h') },
+    { AV_PROFILE_PRORES_XQ,       MKTAG('a', 'p', '4', 'x') },
+};
+
+/*
+ * ProRes is intra-only and its rate follows the profile, so there is no
+ * bit rate, GOP or quantiser range to program: set the profile, then report
+ * the one the driver settled on (it keeps the profile consistent with the
+ * raw format's chroma) so muxers write the matching sample entry.
+ */
+static int v4l2_prepare_prores_encoder(V4L2m2mContext *s)
+{
+    AVCodecContext *avctx = s->avctx;
+    int profile, i;
+
+    if (avctx->profile != AV_PROFILE_UNKNOWN)
+        v4l2_set_ext_ctrl(s, MPEG_CID(PRORES_PROFILE), avctx->profile, "prores profile", 1);
+    if (v4l2_get_ext_ctrl(s, MPEG_CID(PRORES_PROFILE), &profile, "prores profile", 1))
+        return AVERROR(EINVAL);
+
+    for (i = 0; i < FF_ARRAY_ELEMS(v4l2_prores_profiles); i++) {
+        if (v4l2_prores_profiles[i].profile == profile) {
+            avctx->profile   = profile;
+            avctx->codec_tag = v4l2_prores_profiles[i].tag;
+            return 0;
+        }
+    }
+
+    av_log(avctx, AV_LOG_ERROR, "driver reports unknown prores profile %d\n", profile);
+    return AVERROR(EINVAL);
+}
+
 static inline void v4l2_subscribe_eos_event(V4L2m2mContext *s)
 {
     struct v4l2_event_subscription sub;
@@ -191,6 +236,9 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
      */
     if (avctx->framerate.num || avctx->framerate.den)
         v4l2_set_timeperframe(s, avctx->framerate.den, avctx->framerate.num);
+
+    if (avctx->codec_id == AV_CODEC_ID_PRORES)
+        return v4l2_prepare_prores_encoder(s);
 
     /* set ext ctrls */
     v4l2_set_ext_ctrl(s, MPEG_CID(HEADER_MODE), MPEG_VIDEO(HEADER_MODE_SEPARATE), "header mode", 0);
@@ -405,6 +453,17 @@ static const AVOption options[] = {
     { NULL },
 };
 
+static const AVOption prores_options[] = {
+    V4L_M2M_CAPTURE_OPTS,
+    FF_AVCTX_PROFILE_OPTION("proxy",    NULL, VIDEO, AV_PROFILE_PRORES_PROXY)
+    FF_AVCTX_PROFILE_OPTION("lt",       NULL, VIDEO, AV_PROFILE_PRORES_LT)
+    FF_AVCTX_PROFILE_OPTION("standard", NULL, VIDEO, AV_PROFILE_PRORES_STANDARD)
+    FF_AVCTX_PROFILE_OPTION("hq",       NULL, VIDEO, AV_PROFILE_PRORES_HQ)
+    FF_AVCTX_PROFILE_OPTION("4444",     NULL, VIDEO, AV_PROFILE_PRORES_4444)
+    FF_AVCTX_PROFILE_OPTION("4444xq",   NULL, VIDEO, AV_PROFILE_PRORES_XQ)
+    { NULL },
+};
+
 static const FFCodecDefault v4l2_m2m_defaults[] = {
     { "qmin", "-1" },
     { "qmax", "-1" },
@@ -444,3 +503,4 @@ M2MENC(h263, "H.263", options,       AV_CODEC_ID_H263);
 M2MENC(h264, "H.264", options,       AV_CODEC_ID_H264);
 M2MENC(hevc, "HEVC",  options,       AV_CODEC_ID_HEVC);
 M2MENC(vp8,  "VP8",   options,       AV_CODEC_ID_VP8);
+M2MENC(prores, "ProRes", prores_options, AV_CODEC_ID_PRORES);
