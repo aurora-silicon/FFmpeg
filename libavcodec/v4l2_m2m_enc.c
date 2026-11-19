@@ -333,6 +333,15 @@ static int v4l2_send_frame(AVCodecContext *avctx, const AVFrame *frame)
     return ff_v4l2_context_enqueue_frame(output, frame);
 }
 
+/* Whether every output buffer is held by the driver. */
+static int v4l2_output_full(const V4L2Context *output)
+{
+    for (int i = 0; i < output->num_buffers; i++)
+        if (output->buffers[i].status != V4L2BUF_IN_DRIVER)
+            return 0;
+    return 1;
+}
+
 static int v4l2_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
 {
     V4L2m2mContext *s = ((V4L2m2mPriv*)avctx->priv_data)->context;
@@ -377,7 +386,14 @@ static int v4l2_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
     }
 
 dequeue:
-    return ff_v4l2_context_dequeue_packet(capture, avpkt);
+    /*
+     * Only wait for a packet when draining or once the driver holds every
+     * output buffer. Waiting right after queueing a frame would keep a single
+     * frame in flight and leave the device idle between frames; returning
+     * EAGAIN lets the caller queue more input while earlier frames are encoded.
+     */
+    return ff_v4l2_context_dequeue_packet(capture, avpkt,
+                                          s->draining || v4l2_output_full(output) ? -1 : 0);
 }
 
 static av_cold int v4l2_encode_init(AVCodecContext *avctx)
