@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include "libavutil/mem.h"
+#include "libavutil/time.h"
 #include "libavcodec/avcodec.h"
 #include "decode.h"
 #include "v4l2_buffers.h"
@@ -267,6 +268,23 @@ static int v4l2_stop_encode(V4L2Context *ctx)
     return 0;
 }
 
+static V4L2Buffer* v4l2_dequeue_v4l2buf(V4L2Context *ctx, int timeout);
+
+/* Whether the driver still holds output buffers it has not processed. */
+static int v4l2_output_pending(V4L2m2mContext *s)
+{
+    if (!s->output.buffers)
+        return 0;
+
+    while (v4l2_dequeue_v4l2buf(&s->output, 0))
+        ;
+
+    for (int i = 0; i < s->output.num_buffers; i++)
+        if (s->output.buffers[i].status == V4L2BUF_IN_DRIVER)
+            return 1;
+    return 0;
+}
+
 static V4L2Buffer* v4l2_dequeue_v4l2buf(V4L2Context *ctx, int timeout)
 {
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
@@ -292,16 +310,35 @@ static V4L2Buffer* v4l2_dequeue_v4l2buf(V4L2Context *ctx, int timeout)
 
     /* if we are draining and there are no more capture buffers queued in the driver we are done */
     if (!V4L2_TYPE_IS_OUTPUT(ctx->type) && ctx_to_m2mctx(ctx)->draining) {
-        for (i = 0; i < ctx->num_buffers; i++) {
-            /* capture buffer initialization happens during decode hence
-             * detection happens at runtime
-             */
-            if (!ctx->buffers)
-                break;
+        V4L2m2mContext *s = ctx_to_m2mctx(ctx);
+        int waited;
 
-            if (ctx->buffers[i].status == V4L2BUF_IN_DRIVER)
-                goto start;
+        for (waited = 0; ; waited++) {
+            for (i = 0; i < ctx->num_buffers; i++) {
+                /* capture buffer initialization happens during decode hence
+                 * detection happens at runtime
+                 */
+                if (!ctx->buffers)
+                    break;
+
+                if (ctx->buffers[i].status == V4L2BUF_IN_DRIVER)
+                    goto start;
+            }
+
+            /*
+             * An encoder may still hold queued frames while the caller holds
+             * every capture buffer in packets it has not freed yet (a muxer
+             * queue in another thread): wait for one to come back rather than
+             * end the stream without those frames.
+             */
+            if (!ctx->buffers || av_codec_is_decoder(s->avctx->codec) ||
+                waited == 2000 || !v4l2_output_pending(s))
+                break;
+            av_usleep(1000);
         }
+        if (waited == 2000)
+            av_log(logger(ctx), AV_LOG_WARNING, "%s: frames left in the driver: every "
+                   "capture buffer is still held in a packet\n", ctx->name);
         ctx->done = 1;
         return NULL;
     }
@@ -319,7 +356,7 @@ start:
         ret = poll(&pfd, 1, timeout);
         if (ret > 0)
             break;
-        if (errno == EINTR)
+        if (ret < 0 && errno == EINTR)
             continue;
         return NULL;
     }
@@ -644,16 +681,16 @@ int ff_v4l2_context_dequeue_frame(V4L2Context* ctx, AVFrame* frame, int timeout)
     return ff_v4l2_buffer_buf_to_avframe(frame, avbuf);
 }
 
-int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt)
+int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt, int timeout)
 {
     V4L2Buffer *avbuf;
 
     /*
-     * blocks until:
+     * blocks until (at most timeout ms, -1 for no limit):
      *  1. encoded packet available
      *  2. an input buffer ready to be dequeued
      */
-    avbuf = v4l2_dequeue_v4l2buf(ctx, -1);
+    avbuf = v4l2_dequeue_v4l2buf(ctx, timeout);
     if (!avbuf) {
         if (ctx->done)
             return AVERROR_EOF;

@@ -146,9 +146,10 @@ int ff_v4l2_context_set_status(V4L2Context* ctx, uint32_t cmd);
  * The pkt must be non NULL.
  * @param[in] ctx The V4L2Context to dequeue from.
  * @param[inout] pkt The AVPacket to dequeue to.
+ * @param[in] timeout The timeout for dequeue (-1 to block, 0 to return immediately, or milliseconds)
  * @return 0 in case of success, AVERROR(EAGAIN) if no buffer was ready, another negative error in case of error.
  */
-int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt);
+int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt, int timeout);
 
 /**
  * Dequeues a buffer from a V4L2Context to an AVFrame.
