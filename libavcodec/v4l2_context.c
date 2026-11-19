@@ -464,13 +464,11 @@ static int v4l2_release_buffers(V4L2Context* ctx)
     return ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_REQBUFS, &req);
 }
 
-static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfmt)
+static inline int v4l2_try_raw_format(V4L2Context* ctx, uint32_t v4l2_fmt)
 {
     struct v4l2_format *fmt = &ctx->format;
-    uint32_t v4l2_fmt;
     int ret;
 
-    v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2(pixfmt);
     if (!v4l2_fmt)
         return AVERROR(EINVAL);
 
@@ -483,6 +481,11 @@ static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfm
 
     ret = ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_TRY_FMT, fmt);
     if (ret)
+        return AVERROR(EINVAL);
+
+    /* TRY_FMT replaces a pixel format the driver cannot produce right now. */
+    if ((V4L2_TYPE_IS_MULTIPLANAR(ctx->type) ? fmt->fmt.pix_mp.pixelformat :
+                                              fmt->fmt.pix.pixelformat) != v4l2_fmt)
         return AVERROR(EINVAL);
 
     return 0;
@@ -498,9 +501,21 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
     fdesc.type = ctx->type;
 
     if (pixfmt != AV_PIX_FMT_NONE) {
-        ret = v4l2_try_raw_format(ctx, pixfmt);
+        ret = v4l2_try_raw_format(ctx, ff_v4l2_format_avfmt_to_v4l2(pixfmt));
         if (!ret)
             return 0;
+
+        /*
+         * Several V4L2 formats carry the same AVPixelFormat (NV16 and NV16M,
+         * for example): try every one the driver lists before giving up on
+         * the requested pixel format.
+         */
+        for (; !ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_ENUM_FMT, &fdesc); fdesc.index++) {
+            if (ff_v4l2_format_v4l2_to_avfmt(fdesc.pixelformat, AV_CODEC_ID_RAWVIDEO) == pixfmt &&
+                !v4l2_try_raw_format(ctx, fdesc.pixelformat))
+                return 0;
+        }
+        fdesc.index = 0;
     }
 
     for (;;) {
@@ -509,8 +524,8 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
             return AVERROR(EINVAL);
 
         pixfmt = ff_v4l2_format_v4l2_to_avfmt(fdesc.pixelformat, AV_CODEC_ID_RAWVIDEO);
-        ret = v4l2_try_raw_format(ctx, pixfmt);
-        if (ret){
+        if (pixfmt == AV_PIX_FMT_NONE ||
+            v4l2_try_raw_format(ctx, fdesc.pixelformat)) {
             fdesc.index++;
             continue;
         }
