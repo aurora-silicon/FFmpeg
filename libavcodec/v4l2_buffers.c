@@ -30,6 +30,7 @@
 #include <poll.h>
 #include "libavcodec/avcodec.h"
 #include "libavutil/attributes.h"
+#include "libavutil/hwcontext_drm.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/refstruct.h"
@@ -565,9 +566,155 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
  *
  ******************************************************************************/
 
+/* Number of picture planes of a pixel format. */
+static int v4l2_pix_fmt_planes(const AVPixFmtDescriptor *desc)
+{
+    int planes_nb = 0;
+
+    for (int i = 0; i < desc->nb_components; i++)
+        planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
+
+    return planes_nb;
+}
+
+static int v4l2_plane_height(const AVPixFmtDescriptor *desc, int plane, int height)
+{
+    return plane == 1 || plane == 2 ? AV_CEIL_RSHIFT(height, desc->log2_chroma_h) : height;
+}
+
+/*
+ * Line stride of a plane inside a single-buffer V4L2 format, from the stride the
+ * driver reports for the first plane: an interleaved chroma plane (NV12, NV24,
+ * P216, ...) holds two samples per chroma position, a planar one holds one.
+ */
+static int v4l2_plane_linesize(const AVPixFmtDescriptor *desc, int plane, int bytesperline)
+{
+    if (plane != 1 && plane != 2)
+        return bytesperline;
+    if (desc->comp[1].plane == desc->comp[2].plane)
+        return (bytesperline * 2) >> desc->log2_chroma_w;
+    return bytesperline >> desc->log2_chroma_w;
+}
+
+static int v4l2_buffer_drmframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
+{
+    const AVDRMFrameDescriptor *drm = (const AVDRMFrameDescriptor *)frame->data[0];
+    V4L2Context *ctx = out->context;
+    const struct v4l2_format *fmt = &ctx->format;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(ctx->av_pix_fmt);
+    int mplane = V4L2_TYPE_IS_MULTIPLANAR(fmt->type);
+    int height = mplane ? fmt->fmt.pix_mp.height : fmt->fmt.pix.height;
+    const AVDRMPlaneDescriptor *p[AV_DRM_MAX_PLANES];
+    int planes_nb, nb_drm_planes = 0, i, ret;
+
+    if (ctx->memory != V4L2_MEMORY_DMABUF || !drm || !desc)
+        return AVERROR(EINVAL);
+
+    /* Flatten the layers: one NV16 layer and an R8 + GR88 pair describe the same memory. */
+    for (i = 0; i < drm->nb_layers; i++) {
+        for (int j = 0; j < drm->layers[i].nb_planes; j++) {
+            if (nb_drm_planes == AV_DRM_MAX_PLANES)
+                return AVERROR(EINVAL);
+            p[nb_drm_planes++] = &drm->layers[i].planes[j];
+        }
+    }
+
+    planes_nb = v4l2_pix_fmt_planes(desc);
+    if (nb_drm_planes != planes_nb) {
+        av_log(logger(out), AV_LOG_ERROR, "%s: DRM frame has %d planes, %s needs %d\n",
+               ctx->name, nb_drm_planes, desc->name, planes_nb);
+        return AVERROR(EINVAL);
+    }
+
+    if (mplane && out->num_planes > 1 && out->num_planes == planes_nb) {
+        /* One V4L2 plane per picture plane (NV12M, YUV420M, ...). */
+        for (i = 0; i < planes_nb; i++) {
+            const AVDRMObjectDescriptor *obj = &drm->objects[p[i]->object_index];
+            int h = v4l2_plane_height(desc, i, height);
+
+            if (p[i]->pitch != fmt->fmt.pix_mp.plane_fmt[i].bytesperline) {
+                av_log(logger(out), AV_LOG_ERROR, "%s: DRM plane %d pitch %td, driver wants %u\n",
+                       ctx->name, i, p[i]->pitch, fmt->fmt.pix_mp.plane_fmt[i].bytesperline);
+                return AVERROR(EINVAL);
+            }
+            out->planes[i].m.fd        = obj->fd;
+            out->planes[i].data_offset = p[i]->offset;
+            out->planes[i].length      = obj->size;
+            out->planes[i].bytesused   = p[i]->offset + (size_t)p[i]->pitch * h;
+        }
+    } else if (out->num_planes == 1) {
+        /*
+         * Single-buffer format (NV12, NV16, P216, ...): all picture planes must sit
+         * in one dma-buf, laid out as the driver expects them: pitches derived from
+         * bytesperline and each plane right after the previous one.
+         */
+        int bytesperline = mplane ? fmt->fmt.pix_mp.plane_fmt[0].bytesperline :
+                                    fmt->fmt.pix.bytesperline;
+        const AVDRMObjectDescriptor *obj = &drm->objects[p[0]->object_index];
+        ptrdiff_t offset = p[0]->offset;
+
+        for (i = 0; i < planes_nb; i++) {
+            int linesize = v4l2_plane_linesize(desc, i, bytesperline);
+
+            if (p[i]->object_index != p[0]->object_index ||
+                p[i]->pitch != linesize || p[i]->offset != offset) {
+                av_log(logger(out), AV_LOG_ERROR,
+                       "%s: DRM plane %d (object %d, offset %td, pitch %td) does not match "
+                       "the driver layout (object %d, offset %td, pitch %d)\n", ctx->name, i,
+                       p[i]->object_index, p[i]->offset, p[i]->pitch,
+                       p[0]->object_index, offset, linesize);
+                return AVERROR(EINVAL);
+            }
+            offset += (ptrdiff_t)linesize * v4l2_plane_height(desc, i, height);
+        }
+
+        if (mplane) {
+            out->planes[0].m.fd        = obj->fd;
+            out->planes[0].data_offset = p[0]->offset;
+            out->planes[0].length      = obj->size;
+            out->planes[0].bytesused   = offset;
+        } else {
+            if (p[0]->offset) {
+                av_log(logger(out), AV_LOG_ERROR,
+                       "%s: the single-planar API has no data offset\n", ctx->name);
+                return AVERROR(EINVAL);
+            }
+            out->buf.m.fd      = obj->fd;
+            out->buf.length    = obj->size;
+            out->buf.bytesused = offset;
+        }
+    } else {
+        av_log(logger(out), AV_LOG_ERROR, "%s: %d V4L2 planes for %d picture planes\n",
+               ctx->name, out->num_planes, planes_nb);
+        return AVERROR(EINVAL);
+    }
+
+    out->dmabuf_fd = drm->objects[0].fd;
+
+    /* Keep the dma-bufs alive while the driver reads them. */
+    av_frame_free(&out->dmabuf_frame);
+    out->dmabuf_frame = av_frame_alloc();
+    if (!out->dmabuf_frame)
+        return AVERROR(ENOMEM);
+    ret = av_frame_ref(out->dmabuf_frame, frame);
+    if (ret < 0)
+        av_frame_free(&out->dmabuf_frame);
+
+    return ret;
+}
+
 int ff_v4l2_buffer_avframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 {
     v4l2_set_pts(out, frame->pts);
+
+    if (frame->format == AV_PIX_FMT_DRM_PRIME)
+        return v4l2_buffer_drmframe_to_buf(frame, out);
+
+    if (out->context->memory == V4L2_MEMORY_DMABUF) {
+        av_log(logger(out), AV_LOG_ERROR, "%s: expected a DRM PRIME frame\n",
+               out->context->name);
+        return AVERROR(EINVAL);
+    }
 
     return v4l2_buffer_swframe_to_buf(frame, out);
 }
@@ -654,8 +801,9 @@ int ff_v4l2_buffer_initialize(V4L2Buffer* avbuf, int index)
     V4L2Context *ctx = avbuf->context;
     int ret, i;
 
-    avbuf->buf.memory = V4L2_MEMORY_MMAP;
+    avbuf->buf.memory = ctx->memory;
     avbuf->buf.type = ctx->type;
+    avbuf->dmabuf_fd = -1;
     avbuf->buf.index = index;
 
     if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
@@ -682,6 +830,10 @@ int ff_v4l2_buffer_initialize(V4L2Buffer* avbuf, int index)
         avbuf->plane_info[i].bytesperline = V4L2_TYPE_IS_MULTIPLANAR(ctx->type) ?
             ctx->format.fmt.pix_mp.plane_fmt[i].bytesperline :
             ctx->format.fmt.pix.bytesperline;
+
+        /* imported buffers: the memory comes with each queued frame */
+        if (ctx->memory == V4L2_MEMORY_DMABUF)
+            continue;
 
         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
             avbuf->plane_info[i].length = avbuf->buf.m.planes[i].length;

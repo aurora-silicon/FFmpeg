@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include "libavutil/hwcontext_drm.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 #include "libavcodec/avcodec.h"
@@ -414,7 +415,7 @@ start:
 
 dequeue:
         memset(&buf, 0, sizeof(buf));
-        buf.memory = V4L2_MEMORY_MMAP;
+        buf.memory = ctx->memory;
         buf.type = ctx->type;
         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
             memset(planes, 0, sizeof(planes));
@@ -449,6 +450,8 @@ dequeue:
         avbuf = &ctx->buffers[buf.index];
         avbuf->status = V4L2BUF_AVAILABLE;
         avbuf->buf = buf;
+        /* the driver is done reading the imported frame */
+        av_frame_free(&avbuf->dmabuf_frame);
         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
             memcpy(avbuf->planes, planes, sizeof(planes));
             avbuf->buf.m.planes = avbuf->planes;
@@ -481,7 +484,7 @@ static V4L2Buffer* v4l2_getfree_v4l2buf(V4L2Context *ctx)
 static int v4l2_release_buffers(V4L2Context* ctx)
 {
     struct v4l2_requestbuffers req = {
-        .memory = V4L2_MEMORY_MMAP,
+        .memory = ctx->memory,
         .type = ctx->type,
         .count = 0, /* 0 -> unmaps buffers from the driver */
     };
@@ -489,6 +492,8 @@ static int v4l2_release_buffers(V4L2Context* ctx)
 
     for (i = 0; i < ctx->num_buffers; i++) {
         V4L2Buffer *buffer = &ctx->buffers[i];
+
+        av_frame_free(&buffer->dmabuf_frame);
 
         for (j = 0; j < buffer->num_planes; j++) {
             struct V4L2Plane_info *p = &buffer->plane_info[j];
@@ -629,6 +634,25 @@ int ff_v4l2_context_enqueue_frame(V4L2Context* ctx, const AVFrame* frame)
     if (!avbuf)
         return AVERROR(EAGAIN);
 
+    if (ctx->memory == V4L2_MEMORY_DMABUF && frame->format == AV_PIX_FMT_DRM_PRIME) {
+        /*
+         * videobuf2 keeps a dma-buf attached (and its IOMMU mapping cached) only
+         * while the same dma-buf comes back at the same buffer index: prefer the
+         * free buffer that last carried this frame's first dma-buf.
+         */
+        const AVDRMFrameDescriptor *drm = (const AVDRMFrameDescriptor *)frame->data[0];
+        int fd = drm && drm->nb_objects ? drm->objects[0].fd : -1;
+
+        for (int i = 0; fd >= 0 && i < ctx->num_buffers; i++) {
+            V4L2Buffer *b = &ctx->buffers[i];
+
+            if (b->status == V4L2BUF_AVAILABLE && b->dmabuf_fd == fd) {
+                avbuf = b;
+                break;
+            }
+        }
+    }
+
     ret = ff_v4l2_buffer_avframe_to_buf(frame, avbuf);
     if (ret)
         return ret;
@@ -762,9 +786,12 @@ int ff_v4l2_context_init(V4L2Context* ctx)
     if (ret)
         av_log(logger(ctx), AV_LOG_ERROR, "%s VIDIOC_G_FMT failed\n", ctx->name);
 
+    if (!ctx->memory)
+        ctx->memory = V4L2_MEMORY_MMAP;
+
     memset(&req, 0, sizeof(req));
     req.count = ctx->num_buffers;
-    req.memory = V4L2_MEMORY_MMAP;
+    req.memory = ctx->memory;
     req.type = ctx->type;
     ret = ioctl(s->fd, VIDIOC_REQBUFS, &req);
     if (ret < 0) {

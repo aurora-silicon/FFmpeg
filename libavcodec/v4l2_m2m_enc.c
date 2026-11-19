@@ -30,6 +30,7 @@
 #include "libavutil/pixfmt.h"
 #include "libavutil/opt.h"
 #include "codec_internal.h"
+#include "hwconfig.h"
 #include "profiles.h"
 #include "v4l2_context.h"
 #include "v4l2_m2m.h"
@@ -371,6 +372,20 @@ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
     output->av_codec_id = AV_CODEC_ID_RAWVIDEO;
     output->av_pix_fmt = avctx->pix_fmt;
 
+    /*
+     * DRM PRIME input: queue the frames' dma-bufs on the output queue instead of
+     * copying every frame into mmap'ed buffers. The layout comes from sw_pix_fmt
+     * (set from hw_frames_ctx when the caller provides one).
+     */
+    if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
+        if (avctx->sw_pix_fmt == AV_PIX_FMT_NONE) {
+            av_log(avctx, AV_LOG_ERROR, "DRM PRIME input needs sw_pix_fmt or hw_frames_ctx\n");
+            return AVERROR(EINVAL);
+        }
+        output->av_pix_fmt = avctx->sw_pix_fmt;
+        output->memory = V4L2_MEMORY_DMABUF;
+    }
+
     /* capture context */
     capture->av_codec_id = avctx->codec_id;
     capture->av_pix_fmt = AV_PIX_FMT_NONE;
@@ -388,7 +403,7 @@ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
         v4l2_fmt_output = output->format.fmt.pix.pixelformat;
 
     pix_fmt_output = ff_v4l2_format_v4l2_to_avfmt(v4l2_fmt_output, AV_CODEC_ID_RAWVIDEO);
-    if (pix_fmt_output != avctx->pix_fmt) {
+    if (pix_fmt_output != output->av_pix_fmt) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt_output);
         av_log(avctx, AV_LOG_ERROR, "Encoder requires %s pixel format.\n", desc->name);
         return AVERROR(EINVAL);
@@ -421,6 +436,11 @@ static const AVOption options[] = {
     { NULL },
 };
 
+static const AVCodecHWConfigInternal *const v4l2_m2m_enc_hw_configs[] = {
+    HW_CONFIG_ENCODER_FRAMES(DRM_PRIME, DRM),
+    NULL
+};
+
 static const FFCodecDefault v4l2_m2m_defaults[] = {
     { "qmin", "-1" },
     { "qmax", "-1" },
@@ -448,6 +468,7 @@ static const FFCodecDefault v4l2_m2m_defaults[] = {
         FF_CODEC_RECEIVE_PACKET_CB(v4l2_receive_packet), \
         .close          = v4l2_encode_close, \
         .defaults       = v4l2_m2m_defaults, \
+        .hw_configs     = v4l2_m2m_enc_hw_configs, \
         .p.capabilities = AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_DELAY, \
         .color_ranges   = AVCOL_RANGE_MPEG, \
         .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
