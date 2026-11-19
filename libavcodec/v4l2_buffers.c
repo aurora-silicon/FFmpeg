@@ -29,6 +29,7 @@
 #include <poll.h>
 #include "libavcodec/avcodec.h"
 #include "libavutil/attributes.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/refstruct.h"
 #include "v4l2_context.h"
@@ -319,6 +320,42 @@ static int v4l2_bufref_to_buf(V4L2Buffer *out, int plane, const uint8_t* data, i
     return 0;
 }
 
+static int v4l2_pix_fmt_planes(const AVPixFmtDescriptor *desc)
+{
+    int i, planes_nb = 0;
+
+    for (i = 0; i < desc->nb_components; i++)
+        planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
+
+    return planes_nb;
+}
+
+static int v4l2_buffer_height(const V4L2Context *ctx)
+{
+    return V4L2_TYPE_IS_MULTIPLANAR(ctx->type) ? ctx->format.fmt.pix_mp.height :
+                                                 ctx->format.fmt.pix.height;
+}
+
+static int v4l2_plane_height(const AVPixFmtDescriptor *desc, int plane, int height)
+{
+    return plane == 1 || plane == 2 ? AV_CEIL_RSHIFT(height, desc->log2_chroma_h) : height;
+}
+
+/*
+ * Line stride of a plane inside a single-plane V4L2 buffer, from the stride
+ * the driver reports for the first plane: an interleaved chroma plane (NV12,
+ * NV24, P216, ...) holds two samples per chroma position, a planar one holds
+ * one.
+ */
+static int v4l2_plane_linesize(const AVPixFmtDescriptor *desc, int plane, int bytesperline)
+{
+    if (plane != 1 && plane != 2)
+        return bytesperline;
+    if (desc->comp[1].plane == desc->comp[2].plane)
+        return (bytesperline * 2) >> desc->log2_chroma_w;
+    return bytesperline >> desc->log2_chroma_w;
+}
+
 static int v4l2_buffer_buf_to_swframe(AVFrame *frame, V4L2Buffer *avbuf)
 {
     int i, ret;
@@ -334,27 +371,27 @@ static int v4l2_buffer_buf_to_swframe(AVFrame *frame, V4L2Buffer *avbuf)
         frame->data[i] = frame->buf[i]->data;
     }
 
-    /* fixup special cases */
-    switch (avbuf->context->av_pix_fmt) {
-    case AV_PIX_FMT_NV12:
-    case AV_PIX_FMT_NV21:
-        if (avbuf->num_planes > 1)
-            break;
-        frame->linesize[1] = avbuf->plane_info[0].bytesperline;
-        frame->data[1] = frame->buf[0]->data + avbuf->plane_info[0].bytesperline * avbuf->context->format.fmt.pix_mp.height;
-        break;
+    /*
+     * A buffer with one memory plane can still carry a multi-plane pixel
+     * format: the planes follow each other, each starting where the previous
+     * one ends.
+     */
+    if (avbuf->num_planes == 1) {
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+        int planes_nb = v4l2_pix_fmt_planes(desc);
+        int bytesperline = avbuf->plane_info[0].bytesperline;
+        int height = v4l2_buffer_height(avbuf->context);
+        size_t offset = (size_t)bytesperline * height;
 
-    case AV_PIX_FMT_YUV420P:
-        if (avbuf->num_planes > 1)
-            break;
-        frame->linesize[1] = avbuf->plane_info[0].bytesperline >> 1;
-        frame->linesize[2] = avbuf->plane_info[0].bytesperline >> 1;
-        frame->data[1] = frame->buf[0]->data + avbuf->plane_info[0].bytesperline * avbuf->context->format.fmt.pix_mp.height;
-        frame->data[2] = frame->data[1] + ((avbuf->plane_info[0].bytesperline * avbuf->context->format.fmt.pix_mp.height) >> 2);
-        break;
+        for (i = 1; i < planes_nb; i++) {
+            int h = v4l2_plane_height(desc, i, height);
 
-    default:
-        break;
+            frame->linesize[i] = v4l2_plane_linesize(desc, i, bytesperline);
+            if (offset + (size_t)frame->linesize[i] * h > avbuf->plane_info[0].length)
+                return AVERROR(EINVAL);
+            frame->data[i] = frame->buf[0]->data + offset;
+            offset += (size_t)frame->linesize[i] * h;
+        }
     }
 
     return 0;
@@ -396,22 +433,39 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 
     if (!is_planar_format) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
-        int planes_nb = 0;
-        int offset = 0;
+        int planes_nb = v4l2_pix_fmt_planes(desc);
+        int bytesperline = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
+                           fmt.fmt.pix_mp.plane_fmt[0].bytesperline :
+                           fmt.fmt.pix.bytesperline;
+        uint8_t *dst = out->plane_info[0].mm_addr;
+        size_t length = out->plane_info[0].length;
+        size_t offset = 0;
 
-        for (i = 0; i < desc->nb_components; i++)
-            planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
+        if (out->num_planes < 1)
+            return AVERROR(EINVAL);
 
+        /* Lay the planes out with the strides the driver asked for. */
         for (i = 0; i < planes_nb; i++) {
-            int size, h = height;
-            if (i == 1 || i == 2) {
-                h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
-            }
-            size = frame->linesize[i] * h;
-            ret = v4l2_bufref_to_buf(out, 0, frame->data[i], size, offset);
-            if (ret)
-                return ret;
-            offset += size;
+            int h = v4l2_plane_height(desc, i, height);
+            int dst_linesize = bytesperline ?
+                               v4l2_plane_linesize(desc, i, bytesperline) :
+                               frame->linesize[i];
+            int bytes = av_image_get_linesize(frame->format, frame->width, i);
+
+            if (bytes < 0 || bytes > dst_linesize ||
+                offset + (size_t)dst_linesize * h > length)
+                return AVERROR(EINVAL);
+            av_image_copy_plane(dst + offset, dst_linesize,
+                                frame->data[i], frame->linesize[i], bytes, h);
+            offset += (size_t)dst_linesize * h;
+        }
+
+        if (V4L2_TYPE_IS_MULTIPLANAR(out->buf.type)) {
+            out->planes[0].bytesused = offset;
+            out->planes[0].length = length;
+        } else {
+            out->buf.bytesused = offset;
+            out->buf.length = length;
         }
         return 0;
     }
