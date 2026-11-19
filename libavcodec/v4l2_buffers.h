@@ -66,6 +66,11 @@ typedef struct V4L2Buffer {
     int flags;
     enum V4L2Buffer_status status;
 
+    /* V4L2_MEMORY_DMABUF output buffers: the frame whose dma-bufs are queued,
+     * kept referenced until the driver returns the buffer. */
+    AVFrame *dmabuf_frame;
+    /* first dma-buf fd last queued in this buffer, -1 if none */
+    int dmabuf_fd;
 } V4L2Buffer;
 
 /**

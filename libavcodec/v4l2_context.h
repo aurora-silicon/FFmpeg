@@ -48,6 +48,14 @@ typedef struct V4L2Context {
     enum v4l2_buf_type type;
 
     /**
+     * Memory type of the buffers: V4L2_MEMORY_MMAP (the default when left 0)
+     * or V4L2_MEMORY_DMABUF (output queue of an encoder fed AV_PIX_FMT_DRM_PRIME
+     * frames, whose dma-bufs are queued without a copy).
+     * Readonly after init.
+     */
+    enum v4l2_memory memory;
+
+    /**
      * AVPixelFormat corresponding to this buffer context.
      * AV_PIX_FMT_NONE means this is an encoded stream.
      */
