@@ -48,6 +48,14 @@ typedef struct V4L2Context {
     enum v4l2_buf_type type;
 
     /**
+     * Memory type of the buffers: V4L2_MEMORY_MMAP (the default when left 0)
+     * or V4L2_MEMORY_DMABUF (output queue of an encoder fed AV_PIX_FMT_DRM_PRIME
+     * frames, whose dma-bufs are queued without a copy).
+     * Readonly after init.
+     */
+    enum v4l2_memory memory;
+
+    /**
      * AVPixelFormat corresponding to this buffer context.
      * AV_PIX_FMT_NONE means this is an encoded stream.
      */
@@ -146,9 +154,10 @@ int ff_v4l2_context_set_status(V4L2Context* ctx, uint32_t cmd);
  * The pkt must be non NULL.
  * @param[in] ctx The V4L2Context to dequeue from.
  * @param[inout] pkt The AVPacket to dequeue to.
+ * @param[in] timeout The timeout for dequeue (-1 to block, 0 to return immediately, or milliseconds)
  * @return 0 in case of success, AVERROR(EAGAIN) if no buffer was ready, another negative error in case of error.
  */
-int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt);
+int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt, int timeout);
 
 /**
  * Dequeues a buffer from a V4L2Context to an AVFrame.

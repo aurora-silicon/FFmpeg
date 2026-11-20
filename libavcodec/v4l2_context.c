@@ -27,7 +27,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include "libavutil/hwcontext_drm.h"
 #include "libavutil/mem.h"
+#include "libavutil/time.h"
 #include "libavcodec/avcodec.h"
 #include "decode.h"
 #include "v4l2_buffers.h"
@@ -267,6 +269,23 @@ static int v4l2_stop_encode(V4L2Context *ctx)
     return 0;
 }
 
+static V4L2Buffer* v4l2_dequeue_v4l2buf(V4L2Context *ctx, int timeout);
+
+/* Whether the driver still holds output buffers it has not processed. */
+static int v4l2_output_pending(V4L2m2mContext *s)
+{
+    if (!s->output.buffers)
+        return 0;
+
+    while (v4l2_dequeue_v4l2buf(&s->output, 0))
+        ;
+
+    for (int i = 0; i < s->output.num_buffers; i++)
+        if (s->output.buffers[i].status == V4L2BUF_IN_DRIVER)
+            return 1;
+    return 0;
+}
+
 static V4L2Buffer* v4l2_dequeue_v4l2buf(V4L2Context *ctx, int timeout)
 {
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
@@ -292,16 +311,35 @@ static V4L2Buffer* v4l2_dequeue_v4l2buf(V4L2Context *ctx, int timeout)
 
     /* if we are draining and there are no more capture buffers queued in the driver we are done */
     if (!V4L2_TYPE_IS_OUTPUT(ctx->type) && ctx_to_m2mctx(ctx)->draining) {
-        for (i = 0; i < ctx->num_buffers; i++) {
-            /* capture buffer initialization happens during decode hence
-             * detection happens at runtime
-             */
-            if (!ctx->buffers)
-                break;
+        V4L2m2mContext *s = ctx_to_m2mctx(ctx);
+        int waited;
 
-            if (ctx->buffers[i].status == V4L2BUF_IN_DRIVER)
-                goto start;
+        for (waited = 0; ; waited++) {
+            for (i = 0; i < ctx->num_buffers; i++) {
+                /* capture buffer initialization happens during decode hence
+                 * detection happens at runtime
+                 */
+                if (!ctx->buffers)
+                    break;
+
+                if (ctx->buffers[i].status == V4L2BUF_IN_DRIVER)
+                    goto start;
+            }
+
+            /*
+             * An encoder may still hold queued frames while the caller holds
+             * every capture buffer in packets it has not freed yet (a muxer
+             * queue in another thread): wait for one to come back rather than
+             * end the stream without those frames.
+             */
+            if (!ctx->buffers || av_codec_is_decoder(s->avctx->codec) ||
+                waited == 2000 || !v4l2_output_pending(s))
+                break;
+            av_usleep(1000);
         }
+        if (waited == 2000)
+            av_log(logger(ctx), AV_LOG_WARNING, "%s: frames left in the driver: every "
+                   "capture buffer is still held in a packet\n", ctx->name);
         ctx->done = 1;
         return NULL;
     }
@@ -319,7 +357,7 @@ start:
         ret = poll(&pfd, 1, timeout);
         if (ret > 0)
             break;
-        if (errno == EINTR)
+        if (ret < 0 && errno == EINTR)
             continue;
         return NULL;
     }
@@ -377,7 +415,7 @@ start:
 
 dequeue:
         memset(&buf, 0, sizeof(buf));
-        buf.memory = V4L2_MEMORY_MMAP;
+        buf.memory = ctx->memory;
         buf.type = ctx->type;
         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
             memset(planes, 0, sizeof(planes));
@@ -412,6 +450,8 @@ dequeue:
         avbuf = &ctx->buffers[buf.index];
         avbuf->status = V4L2BUF_AVAILABLE;
         avbuf->buf = buf;
+        /* the driver is done reading the imported frame */
+        av_frame_free(&avbuf->dmabuf_frame);
         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
             memcpy(avbuf->planes, planes, sizeof(planes));
             avbuf->buf.m.planes = avbuf->planes;
@@ -444,7 +484,7 @@ static V4L2Buffer* v4l2_getfree_v4l2buf(V4L2Context *ctx)
 static int v4l2_release_buffers(V4L2Context* ctx)
 {
     struct v4l2_requestbuffers req = {
-        .memory = V4L2_MEMORY_MMAP,
+        .memory = ctx->memory,
         .type = ctx->type,
         .count = 0, /* 0 -> unmaps buffers from the driver */
     };
@@ -452,6 +492,8 @@ static int v4l2_release_buffers(V4L2Context* ctx)
 
     for (i = 0; i < ctx->num_buffers; i++) {
         V4L2Buffer *buffer = &ctx->buffers[i];
+
+        av_frame_free(&buffer->dmabuf_frame);
 
         for (j = 0; j < buffer->num_planes; j++) {
             struct V4L2Plane_info *p = &buffer->plane_info[j];
@@ -607,6 +649,25 @@ int ff_v4l2_context_enqueue_frame(V4L2Context* ctx, const AVFrame* frame)
     if (!avbuf)
         return AVERROR(EAGAIN);
 
+    if (ctx->memory == V4L2_MEMORY_DMABUF && frame->format == AV_PIX_FMT_DRM_PRIME) {
+        /*
+         * videobuf2 keeps a dma-buf attached (and its IOMMU mapping cached) only
+         * while the same dma-buf comes back at the same buffer index: prefer the
+         * free buffer that last carried this frame's first dma-buf.
+         */
+        const AVDRMFrameDescriptor *drm = (const AVDRMFrameDescriptor *)frame->data[0];
+        int fd = drm && drm->nb_objects ? drm->objects[0].fd : -1;
+
+        for (int i = 0; fd >= 0 && i < ctx->num_buffers; i++) {
+            V4L2Buffer *b = &ctx->buffers[i];
+
+            if (b->status == V4L2BUF_AVAILABLE && b->dmabuf_fd == fd) {
+                avbuf = b;
+                break;
+            }
+        }
+    }
+
     ret = ff_v4l2_buffer_avframe_to_buf(frame, avbuf);
     if (ret)
         return ret;
@@ -659,16 +720,16 @@ int ff_v4l2_context_dequeue_frame(V4L2Context* ctx, AVFrame* frame, int timeout)
     return ff_v4l2_buffer_buf_to_avframe(frame, avbuf);
 }
 
-int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt)
+int ff_v4l2_context_dequeue_packet(V4L2Context* ctx, AVPacket* pkt, int timeout)
 {
     V4L2Buffer *avbuf;
 
     /*
-     * blocks until:
+     * blocks until (at most timeout ms, -1 for no limit):
      *  1. encoded packet available
      *  2. an input buffer ready to be dequeued
      */
-    avbuf = v4l2_dequeue_v4l2buf(ctx, -1);
+    avbuf = v4l2_dequeue_v4l2buf(ctx, timeout);
     if (!avbuf) {
         if (ctx->done)
             return AVERROR_EOF;
@@ -740,9 +801,12 @@ int ff_v4l2_context_init(V4L2Context* ctx)
     if (ret)
         av_log(logger(ctx), AV_LOG_ERROR, "%s VIDIOC_G_FMT failed\n", ctx->name);
 
+    if (!ctx->memory)
+        ctx->memory = V4L2_MEMORY_MMAP;
+
     memset(&req, 0, sizeof(req));
     req.count = ctx->num_buffers;
-    req.memory = V4L2_MEMORY_MMAP;
+    req.memory = ctx->memory;
     req.type = ctx->type;
     ret = ioctl(s->fd, VIDIOC_REQBUFS, &req);
     if (ret < 0) {
